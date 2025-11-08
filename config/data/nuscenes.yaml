@@ -3,7 +3,7 @@ num_classes: 12                         # do not modify :)
 
 # used to get_split
 version: 'v1.0-trainval'                # 'v1.0-mini' for debugging
-dataset_dir: ???
+dataset_dir: /data1/nuscenes          # path to nuscenes dataset
 labels_dir: ???
 
 # used to generate dataset

@@ -8,5 +8,13 @@ python3 scripts/view_data.py \
 
 python3 scripts/train.py \
   +experiment=cvt_nuscenes_vehicle \
+  data.dataset_dir=/data/datasets/nuscenes \
+  data.labels_dir=/data/datasets/cvt_labels_nuscenes
+
+
+python3 scripts/train.py \
+  +experiment=cvt_nuscenes_vehicle \
   data.dataset_dir=/data/nuscenes \
   data.labels_dir=/data/cvt_labels_nuscenes
+
+  pip install -e .

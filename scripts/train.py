@@ -10,6 +10,7 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from cross_view_transformer.common import setup_config, setup_experiment, load_backbone
 from cross_view_transformer.callbacks.gitdiff_callback import GitDiffCallback
 from cross_view_transformer.callbacks.visualization_callback import VisualizationCallback
+from cross_view_transformer.callbacks.eaf_logging_callback import EAFLoggingCallback
 
 
 log = logging.getLogger(__name__)
@@ -60,7 +61,8 @@ def main(cfg):
                         every_n_train_steps=cfg.experiment.checkpoint_interval),
 
         VisualizationCallback(viz_fn, cfg.experiment.log_image_interval),
-        GitDiffCallback(cfg)
+        GitDiffCallback(cfg),
+        EAFLoggingCallback(lambda_log_interval=50, eaf_vis_interval=100)
     ]
 
     # Train

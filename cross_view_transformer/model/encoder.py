@@ -4,7 +4,13 @@ import torch.nn.functional as F
 
 from einops import rearrange, repeat
 from torchvision.models.resnet import Bottleneck
-from typing import List
+from typing import List, Optional
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 
 
 ResNetBottleNeck = lambda c: Bottleneck(c, c // 4)
@@ -398,18 +404,31 @@ class CrossViewAttention(nn.Module):
         P0 = P0.unsqueeze(0).unsqueeze(0).expand(B, N, Q, 4) # [B,N,Q,4]
         P1 = P1.unsqueeze(0).unsqueeze(0).expand(B, N, Q, 4)
 
-        # world->cam
-        E = torch.inverse(E_inv)                             # [B,N,4,4]
-        P0_cam = torch.einsum('bnij,bnqj->bnqi', E, P0)
-        P1_cam = torch.einsum('bnij,bnqj->bnqi', E, P1)
+        # world->cam (use inverse with better error handling)
+        try:
+            E = torch.inverse(E_inv)
+        except RuntimeError:
+            # fallback: add small regularization
+            E = torch.inverse(E_inv + 1e-6 * torch.eye(4, device=device, dtype=E_inv.dtype).unsqueeze(0).unsqueeze(0))
+
+        P0_cam = torch.einsum('bnij,bnqj->bnqi', E, P0.contiguous())
+        P1_cam = torch.einsum('bnij,bnqj->bnqi', E, P1.contiguous())
 
         # intrinsics
-        I = torch.inverse(I_inv)                             # [B,N,3,3]
+        try:
+            I = torch.inverse(I_inv)
+        except RuntimeError:
+            # fallback: add small regularization
+            I = torch.inverse(I_inv + 1e-6 * torch.eye(3, device=device, dtype=I_inv.dtype).unsqueeze(0).unsqueeze(0))
+
         p0 = torch.einsum('bnij,bnqj->bnqi', I, P0_cam[..., :3])
         p1 = torch.einsum('bnij,bnqj->bnqi', I, P1_cam[..., :3])
 
-        p0 = p0 / (p0[..., 2:3] + 1e-8)
-        p1 = p1 / (p1[..., 2:3] + 1e-8)
+        # safer division with larger epsilon and clamping
+        p0_z = torch.clamp(p0[..., 2:3].abs(), min=1e-6)
+        p1_z = torch.clamp(p1[..., 2:3].abs(), min=1e-6)
+        p0 = p0 / (p0_z * torch.sign(p0[..., 2:3] + 1e-10))
+        p1 = p1 / (p1_z * torch.sign(p1[..., 2:3] + 1e-10))
 
         # epipolar line (homogeneous line)
         l = torch.cross(p0, p1, dim=-1)                      # [B,N,Q,3]
@@ -476,7 +495,143 @@ class CrossViewAttention(nn.Module):
         )
         return out
 
+    # -------- W&B Logging Methods --------
+    @torch.no_grad()
+    def log_lambda_qi(
+        self,
+        bev: BEVEmbedding,
+        E_inv: torch.Tensor,
+        step: int,
+        sample: int = 5,
+        tag: str = "lambda_qi"
+    ):
+        """
+        Log adaptive lambda statistics and samples to W&B.
 
+        Args:
+            bev: BEV embedding containing grid
+            E_inv: [B, N, 4, 4] extrinsics inverse (cam->world)
+            step: current training step
+            sample: number of random samples to log as text
+            tag: W&B logging tag prefix
+        """
+        if not WANDB_AVAILABLE:
+            return
+
+        device = E_inv.device
+        grid = bev.grid.to(device)
+        _, Hb, Wb = grid.shape
+        Q = Hb * Wb
+
+        xy = rearrange(grid[:2], 'c H W -> (H W) c')   # [Q,2]
+        cam_center = E_inv[..., :3, 3]                 # [B,N,3]
+        cam_xy = cam_center[..., :2]                   # [B,N,2]
+
+        B, N = cam_xy.shape[:2]
+        b = 0  # 첫 배치만 로깅
+
+        vec = xy.unsqueeze(0).unsqueeze(0) - cam_xy.unsqueeze(2)   # [B,N,Q,2]
+        dist = torch.norm(vec, dim=-1) + 1e-6                      # [B,N,Q]
+
+        dist_max = dist.amax(dim=(-2, -1), keepdim=True) + 1e-6
+        dist_norm = (dist / dist_max).clamp(0., 1.)
+        sigma_qi = self.max_sigma - dist_norm * (self.max_sigma - self.min_sigma)
+        lambda_qi = 1.0 / (sigma_qi + 1e-6)
+
+        # W&B: 히스토그램/통계
+        d0 = dist[b].flatten().detach().cpu().numpy()
+        s0 = sigma_qi[b].flatten().detach().cpu().numpy()
+        l0 = lambda_qi[b].flatten().detach().cpu().numpy()
+
+        wandb.log({
+            f"{tag}/dist_hist": wandb.Histogram(d0),
+            f"{tag}/sigma_hist": wandb.Histogram(s0),
+            f"{tag}/lambda_hist": wandb.Histogram(l0),
+            f"{tag}/dist_min": float(d0.min()),
+            f"{tag}/dist_median": float(d0[len(d0)//2]),  # approximate median
+            f"{tag}/dist_max": float(d0.max()),
+            f"{tag}/sigma_min": float(s0.min()),
+            f"{tag}/sigma_median": float(s0[len(s0)//2]),
+            f"{tag}/sigma_max": float(s0.max()),
+            f"{tag}/lambda_min": float(l0.min()),
+            f"{tag}/lambda_median": float(l0[len(l0)//2]),
+            f"{tag}/lambda_max": float(l0.max()),
+            "step": step,
+        })
+
+        # 샘플 페어 몇 개 텍스트 로그
+        i_idx = torch.randint(0, N, (sample,), device=device)
+        q_idx = torch.randint(0, Q, (sample,), device=device)
+        lines = []
+        for s in range(sample):
+            i = int(i_idx[s])
+            q = int(q_idx[s])
+            d = float(dist[b, i, q])
+            sg = float(sigma_qi[b, i, q])
+            lam = float(lambda_qi[b, i, q])
+            lines.append(f"cam={i:02d}, q={q:05d} | dist={d:.3f} -> sigma={sg:.3f} -> lambda={lam:.3f}")
+
+        wandb.log({f"{tag}/samples": "\n".join(lines), "step": step})
+
+
+# -------- Utility function for EAF visualization --------
+@torch.no_grad()
+def log_eaf_maps_to_wandb(
+    W_logits: torch.Tensor,   # [B, Q, NK]
+    n_cams: int,
+    feat_h: int,
+    feat_w: int,
+    q_indices,                # int or List[int]
+    step: int,
+    tag: str = "EAF",
+    vmax_auto: bool = True,
+):
+    """
+    Log EAF attention weight maps to W&B as images.
+
+    Args:
+        W_logits: [B, Q, NK] EAF weights
+        n_cams: number of cameras
+        feat_h: feature map height
+        feat_w: feature map width
+        q_indices: single int or list of BEV query indices to visualize
+        step: training step
+        tag: W&B logging tag prefix
+        vmax_auto: if True, normalize each map to [0,1] by its max value
+    """
+    if not WANDB_AVAILABLE:
+        return
+
+    if isinstance(q_indices, int):
+        q_indices = [q_indices]
+
+    B, Q, NK = W_logits.shape
+    assert NK == n_cams * (feat_h * feat_w), f"NK mismatch: {NK} != {n_cams}*{feat_h}*{feat_w}"
+    K_per = feat_h * feat_w
+
+    # 첫 배치만
+    Wb = W_logits[0].detach().cpu()                     # [Q, NK]
+    Wb = Wb.view(Q, n_cams, K_per).view(Q, n_cams, feat_h, feat_w)  # [Q,N,h,w]
+
+    logs = {}
+    for q in q_indices:
+        if q >= Q:
+            continue  # skip invalid indices
+        maps = Wb[q]                                    # [N,h,w]
+        vmax = float(maps.max().clamp_min(1e-8)) if vmax_auto else None
+
+        imgs = []
+        for i in range(n_cams):
+            m = maps[i]
+            if vmax is not None:
+                m = (m / vmax).clamp(0, 1)              # [0,1] normalize
+            img = m.numpy()                              # HxW
+            imgs.append(wandb.Image(img, caption=f"q={q}, cam={i}"))
+
+        logs[f"{tag}/q{q:05d}"] = imgs
+
+    logs["step"] = step
+    wandb.log(logs)
 
 
 class Encoder(nn.Module):
