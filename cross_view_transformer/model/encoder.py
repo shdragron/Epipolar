@@ -371,8 +371,9 @@ class CrossViewAttention(nn.Module):
         vec = xy.unsqueeze(0).unsqueeze(0) - cam_xy.unsqueeze(2)
         dist = torch.norm(vec, dim=-1) + 1e-6         # [B,N,Q]
 
-        dist_max = dist.amax(dim=(-2, -1), keepdim=True) + 1e-6
-        dist_norm = (dist / dist_max).clamp(0., 1.)
+        # 카메라별 최대 거리로 정규화 (권장)
+        dist_max = dist.amax(dim=-1, keepdim=True)    # [B, N, 1]
+        dist_norm = (dist / (dist_max + 1e-6)).clamp(0., 1.)
 
         # 가까울수록 σ 큼(완만), 멀수록 σ 작음(날카로움)
         sigma_qi = self.max_sigma - dist_norm * (self.max_sigma - self.min_sigma)
@@ -427,8 +428,9 @@ class CrossViewAttention(nn.Module):
         # safer division with larger epsilon and clamping
         p0_z = torch.clamp(p0[..., 2:3].abs(), min=1e-6)
         p1_z = torch.clamp(p1[..., 2:3].abs(), min=1e-6)
-        p0 = p0 / (p0_z * torch.sign(p0[..., 2:3] + 1e-10))
-        p1 = p1 / (p1_z * torch.sign(p1[..., 2:3] + 1e-10))
+        p0 = p0 / torch.clamp(p0[..., 2:3], min=1e-6)
+        p1 = p1 / torch.clamp(p1[..., 2:3], min=1e-6)
+
 
         # epipolar line (homogeneous line)
         l = torch.cross(p0, p1, dim=-1)                      # [B,N,Q,3]
@@ -533,8 +535,9 @@ class CrossViewAttention(nn.Module):
         vec = xy.unsqueeze(0).unsqueeze(0) - cam_xy.unsqueeze(2)   # [B,N,Q,2]
         dist = torch.norm(vec, dim=-1) + 1e-6                      # [B,N,Q]
 
-        dist_max = dist.amax(dim=(-2, -1), keepdim=True) + 1e-6
-        dist_norm = (dist / dist_max).clamp(0., 1.)
+        # 카메라별 최대 거리로 정규화 (권장)
+        dist_max = dist.amax(dim=-1, keepdim=True)                 # [B, N, 1]
+        dist_norm = (dist / (dist_max + 1e-6)).clamp(0., 1.)
         sigma_qi = self.max_sigma - dist_norm * (self.max_sigma - self.min_sigma)
         lambda_qi = 1.0 / (sigma_qi + 1e-6)
 
@@ -542,6 +545,11 @@ class CrossViewAttention(nn.Module):
         d0 = dist[b].flatten().detach().cpu().numpy()
         s0 = sigma_qi[b].flatten().detach().cpu().numpy()
         l0 = lambda_qi[b].flatten().detach().cpu().numpy()
+
+        # Spearman correlation
+        from scipy.stats import spearmanr
+        rho_dist_sigma, _ = spearmanr(d0, s0)  # 기대: 음수 (먼 거리 -> 작은 sigma)
+        rho_dist_lambda, _ = spearmanr(d0, l0)  # 기대: 양수 (먼 거리 -> 큰 lambda)
 
         wandb.log({
             f"{tag}/dist_hist": wandb.Histogram(d0),
@@ -556,6 +564,8 @@ class CrossViewAttention(nn.Module):
             f"{tag}/lambda_min": float(l0.min()),
             f"{tag}/lambda_median": float(l0[len(l0)//2]),
             f"{tag}/lambda_max": float(l0.max()),
+            f"{tag}/spearman_dist_sigma": float(rho_dist_sigma),
+            f"{tag}/spearman_dist_lambda": float(rho_dist_lambda),
             "step": step,
         })
 
@@ -573,6 +583,262 @@ class CrossViewAttention(nn.Module):
 
         wandb.log({f"{tag}/samples": "\n".join(lines), "step": step})
 
+    @torch.no_grad()
+    def log_epipolar_diagnostics(
+        self,
+        bev: BEVEmbedding,
+        I_inv: torch.Tensor,
+        E_inv: torch.Tensor,
+        step: int,
+        num_samples: int = 100,
+        tag: str = "epipolar_diag"
+    ):
+        """
+        Log epipolar line diagnostics: frustum checks, depth checks, etc.
+
+        Args:
+            bev: BEV embedding
+            I_inv: [B, N, 3, 3] intrinsics inverse
+            E_inv: [B, N, 4, 4] extrinsics inverse
+            step: training step
+            num_samples: number of random query samples
+            tag: W&B tag prefix
+        """
+        if not WANDB_AVAILABLE:
+            return
+
+        device = E_inv.device
+        B, N = E_inv.shape[:2]
+        grid = bev.grid.to(device)
+        _, H_bev, W_bev = grid.shape
+        Q = H_bev * W_bev
+
+        # Get feature resolution from image_plane
+        _, _, feat_h, feat_w = self.image_plane.shape
+
+        # Scale intrinsics from image resolution to feature resolution
+        # image_plane is scaled by (image_w, image_h) at construction (lines 320-322)
+        # We need to invert this to get feature coordinates
+        img_plane_sample = self.image_plane[:, :, 0, 0]  # [1, 3]
+        img_w = img_plane_sample[0, 0].item() * feat_w  # recover image width
+        img_h = img_plane_sample[0, 1].item() * feat_h  # recover image height
+
+        # Actually, let's use the max values from image_plane directly
+        img_w = self.image_plane[0, 0].max().item()
+        img_h = self.image_plane[0, 1].max().item()
+
+        # Scale factor: feature_size / image_size
+        scale_x = feat_w / max(img_w, 1e-6)
+        scale_y = feat_h / max(img_h, 1e-6)
+
+        xy = rearrange(grid[:2], 'c H W -> (H W) c')  # [Q,2]
+        ones = torch.ones(Q, 1, device=device, dtype=grid.dtype)
+        zeros = torch.zeros(Q, 1, device=device, dtype=grid.dtype)
+
+        # Sample random queries
+        q_samples = torch.randperm(Q, device=device)[:num_samples]
+        xy_sample = xy[q_samples]  # [num_samples, 2]
+
+        # Define epipolar line endpoints
+        P0 = torch.cat([xy_sample, zeros[:num_samples], ones[:num_samples]], dim=-1)  # [num_samples, 4]
+        P1 = torch.cat([xy_sample, self.eaf_zmax * ones[:num_samples], ones[:num_samples]], dim=-1)
+
+        P0 = P0.unsqueeze(0).unsqueeze(0).expand(B, N, num_samples, 4)
+        P1 = P1.unsqueeze(0).unsqueeze(0).expand(B, N, num_samples, 4)
+
+        # Transform to camera space: ego->cam
+        # E_inv is cam->ego, so we need ego->cam
+        try:
+            E = torch.inverse(E_inv)
+        except RuntimeError:
+            E = torch.inverse(E_inv + 1e-6 * torch.eye(4, device=device, dtype=E_inv.dtype).unsqueeze(0).unsqueeze(0))
+
+        P0_cam = torch.einsum('bnij,bnqj->bnqi', E, P0.contiguous())
+        P1_cam = torch.einsum('bnij,bnqj->bnqi', E, P1.contiguous())
+
+        # Check depths (Z > 0)
+        z0 = P0_cam[..., 2]  # [B, N, num_samples]
+        z1 = P1_cam[..., 2]
+
+        # Project to image coordinates (image resolution)
+        try:
+            I = torch.inverse(I_inv)
+        except RuntimeError:
+            I = torch.inverse(I_inv + 1e-6 * torch.eye(3, device=device, dtype=I_inv.dtype).unsqueeze(0).unsqueeze(0))
+
+        p0 = torch.einsum('bnij,bnqj->bnqi', I, P0_cam[..., :3])
+        p1 = torch.einsum('bnij,bnqj->bnqi', I, P1_cam[..., :3])
+
+        # Normalize by depth to get (u, v) in image coordinates
+        u0_img = p0[..., 0] / (torch.clamp(p0[..., 2].abs(), min=1e-6) * torch.sign(p0[..., 2] + 1e-10))
+        v0_img = p0[..., 1] / (torch.clamp(p0[..., 2].abs(), min=1e-6) * torch.sign(p0[..., 2] + 1e-10))
+        u1_img = p1[..., 0] / (torch.clamp(p1[..., 2].abs(), min=1e-6) * torch.sign(p1[..., 2] + 1e-10))
+        v1_img = p1[..., 1] / (torch.clamp(p1[..., 2].abs(), min=1e-6) * torch.sign(p1[..., 2] + 1e-10))
+
+        # Scale to feature coordinates
+        u0 = u0_img * scale_x
+        v0 = v0_img * scale_y
+        u1 = u1_img * scale_x
+        v1 = v1_img * scale_y
+
+        # Check if points are in feature bounds [0, feat_w] x [0, feat_h]
+        p0_in_bounds = ((u0 >= 0) & (u0 < feat_w) & (v0 >= 0) & (v0 < feat_h))
+        p1_in_bounds = ((u1 >= 0) & (u1 < feat_w) & (v1 >= 0) & (v1 < feat_h))
+
+        # Statistics (first batch only)
+        b = 0
+        logs = {}
+
+        for cam_idx in range(N):
+            z0_cam = z0[b, cam_idx]  # [num_samples]
+            z1_cam = z1[b, cam_idx]
+
+            pct_z0_positive = float((z0_cam > 0).float().mean() * 100)
+            pct_z1_positive = float((z1_cam > 0).float().mean() * 100)
+
+            p0_in = p0_in_bounds[b, cam_idx].float().mean() * 100
+            p1_in = p1_in_bounds[b, cam_idx].float().mean() * 100
+            either_in = ((p0_in_bounds[b, cam_idx] | p1_in_bounds[b, cam_idx]).float().mean() * 100)
+
+            logs[f"{tag}/cam{cam_idx}_z0_positive_pct"] = pct_z0_positive
+            logs[f"{tag}/cam{cam_idx}_z1_positive_pct"] = pct_z1_positive
+            logs[f"{tag}/cam{cam_idx}_p0_inbounds_pct"] = float(p0_in)
+            logs[f"{tag}/cam{cam_idx}_p1_inbounds_pct"] = float(p1_in)
+            logs[f"{tag}/cam{cam_idx}_either_inbounds_pct"] = float(either_in)
+
+        logs["step"] = step
+        wandb.log(logs)
+
+
+# -------- Fig.3 style visualization --------
+@torch.no_grad()
+def log_eaf_fig3_style(
+    W_logits: torch.Tensor,     # [B, Q, NK]
+    bev_grid: torch.Tensor,     # [3, H, W] BEV grid
+    I_inv: torch.Tensor,        # [B, N, 3, 3] intrinsics inverse
+    E_inv: torch.Tensor,        # [B, N, 4, 4] extrinsics inverse
+    n_cams: int,
+    feat_h: int,
+    feat_w: int,
+    cam_idx: int = 0,           # front camera
+    q_samples=None,             # list of (x, y) coordinates
+    step: int = 0,
+    tag: str = "EAF_Fig3",
+):
+    """
+    Create Fig.3-style visualization showing:
+    - BEV grid with visibility mask for selected camera
+    - EAF heatmaps for selected query points
+    """
+    if not WANDB_AVAILABLE:
+        return
+
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    if q_samples is None:
+        q_samples = [(10.0, 0.0), (25.0, -3.0), (25.0, 3.0)]
+
+    b_idx = 0
+    B, Q, NK = W_logits.shape
+    K_per = feat_h * feat_w
+
+    # Reshape W_logits
+    W_cam = W_logits[b_idx].view(Q, n_cams, feat_h, feat_w)[:, cam_idx]  # [Q, h, w]
+
+    H_bev, W_bev = bev_grid.shape[-2:]
+    assert Q == H_bev * W_bev
+
+    # Compute visibility mask for this camera
+    try:
+        I = torch.inverse(I_inv[b_idx, cam_idx])
+        E = torch.inverse(E_inv[b_idx, cam_idx])
+    except RuntimeError:
+        I = torch.inverse(I_inv[b_idx, cam_idx] + 1e-6 * torch.eye(3, device=I_inv.device, dtype=I_inv.dtype))
+        E = torch.inverse(E_inv[b_idx, cam_idx] + 1e-6 * torch.eye(4, device=E_inv.device, dtype=E_inv.dtype))
+
+    # Transform BEV points to camera
+    xy = rearrange(bev_grid[:2], 'c h w -> (h w) c')  # [Q, 2]
+    zeros = torch.zeros(Q, 1, device=bev_grid.device, dtype=bev_grid.dtype)
+    ones = torch.ones(Q, 1, device=bev_grid.device, dtype=bev_grid.dtype)
+    Xw = torch.cat([xy, zeros, ones], dim=-1)  # [Q, 4] homogeneous
+
+    Xc = (E @ Xw.T).T[:, :3]  # [Q, 3] in camera space
+    zc = Xc[:, 2]
+
+    # Project to image
+    p = (I @ Xc.T).T  # [Q, 3]
+    u = p[:, 0] / (p[:, 2] + 1e-6)
+    v = p[:, 1] / (p[:, 2] + 1e-6)
+
+    # Check visibility
+    ok_z = zc > 0
+    ok_u = (u >= 0) & (u <= 1)
+    ok_v = (v >= 0) & (v <= 1)
+    vis_mask = (ok_z & ok_u & ok_v).view(H_bev, W_bev).cpu().numpy()
+
+    # Create figure
+    fig = plt.figure(figsize=(12, 6))
+    gs = fig.add_gridspec(2, 3, height_ratios=[1, 1])
+    ax_grid = fig.add_subplot(gs[:, 0])
+    ax_im1 = fig.add_subplot(gs[0, 1])
+    ax_im2 = fig.add_subplot(gs[0, 2])
+    ax_im3 = fig.add_subplot(gs[1, 1])
+
+    # Plot BEV visibility
+    grid_vis = np.zeros((H_bev, W_bev), dtype=np.float32)
+    grid_vis[vis_mask] = 1.0
+    ax_grid.imshow(grid_vis, origin='lower', cmap='viridis', vmin=0, vmax=1)
+    ax_grid.set_title(f"BEV cells visible to cam{cam_idx}")
+    ax_grid.set_xlabel("x (forward)")
+    ax_grid.set_ylabel("y (lateral)")
+
+    # Find query indices for target coordinates
+    xy_np = xy.cpu().numpy()
+
+    def pick_q(x_star, y_star):
+        d2 = (xy_np[:, 0] - x_star)**2 + (xy_np[:, 1] - y_star)**2
+        return int(np.argmin(d2))
+
+    targets = list(q_samples)[:3]
+    axs = [ax_im1, ax_im2, ax_im3]
+
+    for (x_star, y_star), ax in zip(targets, axs):
+        q = pick_q(x_star, y_star)
+
+        # Get the actual (x, y) ego coordinates for this query
+        x_q = xy_np[q, 0]
+        y_q = xy_np[q, 1]
+
+        # Find the (row, col) in BEV grid
+        # bev_grid has shape [3, H, W], flattened to [Q, 3] with row-major order
+        r = q // W_bev
+        c = q % W_bev
+
+        # Debug: print to verify coordinates match
+        print(f"Target: ({x_star:.1f}, {y_star:.1f}) -> q={q} at grid (r={r}, c={c}) with ego ({x_q:.1f}, {y_q:.1f})")
+
+        # Highlight on BEV grid
+        # Note: imshow with origin='lower' means row=0 is at bottom
+        # matplotlib Rectangle uses (x, y) = (col, row) coordinates
+        rect = plt.Rectangle((c - 0.5, r - 0.5), 1, 1,
+                            fill=False, edgecolor='red', lw=2)
+        ax_grid.add_patch(rect)
+
+        # Show EAF heatmap
+        heat = W_cam[q].cpu().numpy()  # [h, w]
+        im = ax.imshow(heat, origin='upper', cmap='magma', vmin=0, vmax=1)
+        ax.set_title(f"({x_star:.1f}m, {y_star:.1f}m)")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        plt.colorbar(im, ax=ax, fraction=0.046)
+
+    plt.tight_layout()
+
+    # Log to W&B
+    wandb.log({f"{tag}/cam{cam_idx}": wandb.Image(fig), "step": step})
+    plt.close(fig)
+
 
 # -------- Utility function for EAF visualization --------
 @torch.no_grad()
@@ -585,6 +851,7 @@ def log_eaf_maps_to_wandb(
     step: int,
     tag: str = "EAF",
     vmax_auto: bool = True,
+    q_coords=None,            # Optional list of (x, y) coordinates
 ):
     """
     Log EAF attention weight maps to W&B as images.
@@ -598,6 +865,7 @@ def log_eaf_maps_to_wandb(
         step: training step
         tag: W&B logging tag prefix
         vmax_auto: if True, normalize each map to [0,1] by its max value
+        q_coords: optional list of (x, y) coordinates for each query
     """
     if not WANDB_AVAILABLE:
         return
@@ -614,11 +882,18 @@ def log_eaf_maps_to_wandb(
     Wb = Wb.view(Q, n_cams, K_per).view(Q, n_cams, feat_h, feat_w)  # [Q,N,h,w]
 
     logs = {}
-    for q in q_indices:
+    for idx, q in enumerate(q_indices):
         if q >= Q:
             continue  # skip invalid indices
         maps = Wb[q]                                    # [N,h,w]
         vmax = float(maps.max().clamp_min(1e-8)) if vmax_auto else None
+
+        # Build tag with coordinates if available
+        if q_coords is not None and idx < len(q_coords):
+            x, y = q_coords[idx]
+            tag_suffix = f"x{x:.1f}_y{y:.1f}"
+        else:
+            tag_suffix = f"q{q:05d}"
 
         imgs = []
         for i in range(n_cams):
@@ -626,9 +901,17 @@ def log_eaf_maps_to_wandb(
             if vmax is not None:
                 m = (m / vmax).clamp(0, 1)              # [0,1] normalize
             img = m.numpy()                              # HxW
-            imgs.append(wandb.Image(img, caption=f"q={q}, cam={i}"))
 
-        logs[f"{tag}/q{q:05d}"] = imgs
+            # Caption with coordinates if available
+            if q_coords is not None and idx < len(q_coords):
+                x, y = q_coords[idx]
+                caption = f"({x:.1f}m, {y:.1f}m) cam={i}"
+            else:
+                caption = f"q={q}, cam={i}"
+
+            imgs.append(wandb.Image(img, caption=caption))
+
+        logs[f"{tag}/{tag_suffix}"] = imgs
 
     logs["step"] = step
     wandb.log(logs)
