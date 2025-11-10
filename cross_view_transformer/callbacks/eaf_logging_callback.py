@@ -26,8 +26,8 @@ class EAFLoggingCallback(pl.Callback):
 
     def __init__(
         self,
-        lambda_log_interval: int = 200,
-        eaf_vis_interval: int = 400,
+        lambda_log_interval: int = 4000,
+        eaf_vis_interval: int = 4000,
         num_samples: int = 8,
         num_query_vis: int = 4,
     ):
