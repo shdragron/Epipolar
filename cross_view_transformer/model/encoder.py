@@ -377,14 +377,11 @@ class CrossViewAttention(nn.Module):
         vec = xy.unsqueeze(0).unsqueeze(0) - cam_xy.unsqueeze(2)
         dist = torch.norm(vec, dim=-1) + 1e-6         # [B,N,Q]
 
-        # 전역 정규화 (모든 카메라+쿼리 통틀어 최대 거리)
-        # 이렇게 해야 front/side 카메라 간 상대적 거리 차이가 보존됨
-        dist_max = dist.amax(dim=(-2, -1), keepdim=True)  # [B, 1, 1]
+        # 카메라별 최대 거리로 정규화 (권장)
+        dist_max = dist.amax(dim=-1, keepdim=True)    # [B, N, 1]
         dist_norm = (dist / (dist_max + 1e-6)).clamp(0., 1.)
 
         # 가까울수록 σ 큼(완만), 멀수록 σ 작음(날카로움)
-        # 비선형 매핑으로 극단 차이 강조
-        dist_norm = dist_norm ** 1.5  # 먼 거리를 더욱 압축
         sigma_qi = self.max_sigma - dist_norm * (self.max_sigma - self.min_sigma)
         lambda_qi = 1.0 / (sigma_qi + 1e-6)
 
