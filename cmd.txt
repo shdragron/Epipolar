@@ -19,6 +19,14 @@ python3 scripts/train.py \
 
   pip install -e .
 
-python scripts/eval.py data=nuscenes model=cvt \
-  +experiment.checkpoint_path=/path/to/checkpoint.ckpt \
-  trainer.gpus=0
+python scripts/eval.py data=nuscenes_vehicle model=cvt \
+  +experiment.checkpoint_path=/home/moon/code/cross_view_transformers/logs/nuscenes_Epipolar/1110_134736/checkpoints/model-v1.ckpt \
+  trainer.gpus=1 \
+  data.labels_dir=/data/cvt_labels_nuscenes \
+  data.dataset_dir=/data/nuscenes \
+  model.outputs.bev=[0,1] \
+  +model.outputs.center=[1,2]
+
+  git config --global credential.helper store
+
+  printf "https://shdragron:<token>@github.com\n" > ~/.git-credentials
