@@ -18,3 +18,7 @@ python3 scripts/train.py \
   data.labels_dir=/data/cvt_labels_nuscenes
 
   pip install -e .
+
+python scripts/eval.py data=nuscenes model=cvt \
+  +experiment.checkpoint_path=/path/to/checkpoint.ckpt \
+  trainer.gpus=0
