@@ -38,7 +38,25 @@ def main(cfg):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
     log.info(f"Loading checkpoint from {ckpt_path}")
-    model_module.backbone = load_backbone(str(ckpt_path))
+
+    # Load checkpoint weights without rebuilding model architecture
+    checkpoint = torch.load(str(ckpt_path), map_location='cpu')
+    state_dict = checkpoint['state_dict']
+
+    # Filter backbone weights
+    backbone_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith('backbone.'):
+            # Remove 'backbone.' prefix
+            backbone_state_dict[k[9:]] = v
+
+    # Load weights into existing model (with strict=False to handle shape mismatches gracefully)
+    missing_keys, unexpected_keys = model_module.backbone.load_state_dict(backbone_state_dict, strict=False)
+
+    if missing_keys:
+        log.warning(f"Missing keys when loading checkpoint: {missing_keys}")
+    if unexpected_keys:
+        log.warning(f"Unexpected keys when loading checkpoint: {unexpected_keys}")
 
     # Setup logger (optional for eval)
     logger = None
@@ -51,12 +69,22 @@ def main(cfg):
         )
 
     # Eval trainer
-    trainer = pl.Trainer(
-        logger=logger,
-        strategy=DDPStrategy(find_unused_parameters=False) if torch.cuda.device_count() > 1 else 'auto',
-        devices=cfg.trainer.get('gpus', 1) if isinstance(cfg.trainer.get('gpus'), int) else len(cfg.trainer.get('gpus', [0])),
-        accelerator='gpu' if torch.cuda.is_available() else 'cpu',
-    )
+    gpus_cfg = cfg.trainer.get('gpus', 1)
+    use_cpu = gpus_cfg == 0 or not torch.cuda.is_available()
+
+    trainer_kwargs = {
+        'logger': logger,
+    }
+
+    if use_cpu:
+        trainer_kwargs['accelerator'] = 'cpu'
+    else:
+        trainer_kwargs['accelerator'] = 'gpu'
+        trainer_kwargs['devices'] = gpus_cfg if isinstance(gpus_cfg, int) else len(gpus_cfg)
+        if torch.cuda.device_count() > 1:
+            trainer_kwargs['strategy'] = DDPStrategy(find_unused_parameters=False)
+
+    trainer = pl.Trainer(**trainer_kwargs)
 
     # Run evaluation on validation set
     log.info("Starting evaluation on validation set...")
