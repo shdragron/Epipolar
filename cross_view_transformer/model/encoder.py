@@ -348,6 +348,12 @@ class CrossViewAttention(nn.Module):
         self.min_sigma = min_sigma
         self.max_sigma = max_sigma
 
+        # Store original image dimensions for proper visibility scaling
+        self.image_height = image_height
+        self.image_width = image_width
+        self.feat_height = feat_height
+        self.feat_width = feat_width
+
     # -------- Adaptive λ_{q,i} --------
     def _compute_lambda_qi(self, bev: BEVEmbedding, E_inv: torch.Tensor):
         """
@@ -455,6 +461,59 @@ class CrossViewAttention(nn.Module):
         scale = (lam * lambda_qi)**2                         # [B,N,Q,1]
 
         W = torch.exp(- scale * (d ** 2))                    # [B,N,Q,K_per]
+
+        # ====== [NEW] 가시성 게이트 (다중 z-샘플링 + 정확한 스케일링) ======
+        # 정확한 feat 스케일 (원본 이미지 해상도 기준)
+        feat_h, feat_w = self.feat_height, self.feat_width
+        scale_x = feat_w / float(self.image_width)
+        scale_y = feat_h / float(self.image_height)
+
+        # 다중 z 샘플링 (any-of 방식)
+        z_samples = torch.tensor([0.2, 1.2, 2.5, self.eaf_zmax],
+                                 device=device, dtype=grid.dtype)  # [Nz]
+        Nz = len(z_samples)
+
+        # BEV 좌표를 다중 z로 확장
+        xy = rearrange(grid[:2], 'c H W -> (H W) c')              # [Q,2]
+        ones_Q = torch.ones(Q, 1, device=device, dtype=grid.dtype)
+
+        # [Q, Nz, 4] 형태로 구성
+        xy_expand = xy.unsqueeze(1).expand(Q, Nz, 2)              # [Q,Nz,2]
+        z_expand = z_samples.view(1, Nz, 1).expand(Q, Nz, 1)      # [Q,Nz,1]
+        ones_expand = ones_Q.unsqueeze(1).expand(Q, Nz, 1)        # [Q,Nz,1]
+        Pz = torch.cat([xy_expand, z_expand, ones_expand], dim=-1)  # [Q,Nz,4]
+
+        # [B,N,Q,Nz,4]로 확장 후 변환
+        Pz = Pz.unsqueeze(0).unsqueeze(0).expand(B, N, Q, Nz, 4)
+
+        # 카메라 좌표계로 변환: [B,N,Q,Nz,4]
+        E = torch.inverse(E_inv)
+        Pz_cam = torch.einsum('bnij,bnqzj->bnqzi', E, Pz)
+
+        # cheirality 체크
+        z_cam = Pz_cam[..., 2]                                     # [B,N,Q,Nz]
+        cheir = (z_cam > 0)                                        # [B,N,Q,Nz]
+
+        # 픽셀 투영
+        pz = torch.einsum('bnij,bnqzj->bnqzi', I, Pz_cam[..., :3])  # [B,N,Q,Nz,3]
+        u = pz[..., 0] / torch.clamp(pz[..., 2], min=1e-6)
+        v = pz[..., 1] / torch.clamp(pz[..., 2], min=1e-6)
+
+        # 이미지 좌표 → feature 좌표
+        u_feat = u * scale_x
+        v_feat = v * scale_y
+
+        # in-bounds 체크
+        inb = (u_feat >= 0) & (u_feat < feat_w) & (v_feat >= 0) & (v_feat < feat_h)  # [B,N,Q,Nz]
+
+        # any-of: 하나라도 보이면 visible
+        vis_per_z = cheir & inb                                    # [B,N,Q,Nz]
+        vis = vis_per_z.any(dim=-1).float()[..., None]            # [B,N,Q,1]
+
+        # 보이지 않는 카메라는 전 픽셀 0
+        W = W * vis                                                # [B,N,Q,K_per]
+
+        # ====== [END NEW] ======
 
         # 카메라+픽셀 축 flatten → [B,Q,NK]
         W = rearrange(W, 'b n Q K -> b Q (n K)')
