@@ -8,7 +8,7 @@ from typing import List, Optional
 
 try:
     import wandb
-    WANDB_AVAILABLE = True
+    WANDB_AVAILABLE = True  # Set to True to enable custom EAF logging
 except ImportError:
     WANDB_AVAILABLE = False
 
@@ -106,8 +106,9 @@ class BEVEmbedding(nn.Module):
         grid[1] = bev_height * grid[1]
 
         # map from bev coordinates to ego frame
-        V = get_view_matrix(bev_height, bev_width, h_meters, w_meters, offset)  # 3 3
-        V_inv = torch.FloatTensor(V).inverse()                                  # 3 3
+        V = torch.tensor(get_view_matrix(bev_height, bev_width, h_meters, w_meters, offset),
+                        dtype=grid.dtype, device=grid.device)
+        V_inv = torch.linalg.inv(V)                                 # 3 3
         grid = V_inv @ rearrange(grid, 'd h w -> d (h w)')                      # 3 (h w)
         grid = rearrange(grid, 'd (h w) -> d h w', h=h, w=w)                    # 3 h w
 
@@ -159,12 +160,13 @@ class CrossAttentionEAF(nn.Module):
         )
         self.postnorm = norm(dim)
 
-    def forward(self, q, k, v, W_logits, skip=None):
+    def forward(self, q, k, v, W_logits, vis_flat, skip=None):
         """
         q: [B, D, H_bev, W_bev]
         k: [B, N, D, h, w]
         v: [B, N, D, h, w]
         W_logits: [B, Q, NK]
+        vis_flat: [B, Q, NK]  # visibility mask (0 or 1)
         """
         B, D, H_bev, W_bev = q.shape
         Bk, N, Dk, h, w = k.shape
@@ -201,9 +203,15 @@ class CrossAttentionEAF(nn.Module):
         # logits: [B, H, Q, NK]
         logits = torch.einsum('b h Q d, b h K d -> b h Q K', q, k) * self.scale
 
+        # ---- mask invisible keys ----
+        # vis_flat: [B, Q, NK] -> [B, 1, Q, NK], broadcast to [B, H, Q, NK]
+        # Use dtype-safe minimum value for fp16/fp32 compatibility
+        neg_inf = torch.finfo(logits.dtype).min
+        logits = logits.masked_fill(vis_flat.unsqueeze(1) == 0, neg_inf)
+
         # ---- apply Epipolar weights (multiplicative, as in W ⊙ (QK^T/√d)) ----
-        # W_logits: [B, Q, NK] -> [B, 1, Q, NK] -> [B, H, Q, NK]
-        W = W_logits.unsqueeze(1).expand(-1, self.heads, -1, -1)
+        # W_logits: [B, Q, NK] -> [B, 1, Q, NK], broadcast to [B, H, Q, NK]
+        W = W_logits.unsqueeze(1)  # Broadcasting instead of expand
         logits = logits * W
 
         # ---- softmax over keys ----
@@ -355,21 +363,24 @@ class CrossViewAttention(nn.Module):
         self.feat_width = feat_width
 
     # -------- Adaptive λ_{q,i} --------
-    def _compute_lambda_qi(self, bev: BEVEmbedding, E_inv: torch.Tensor):
+    @torch.no_grad()  # No gradients needed for geometric computation
+    def _compute_lambda_qi(self, bev: BEVEmbedding, E: torch.Tensor):
         """
         Adaptive λ_{q,i}
         bev.grid: [3, H_bev, W_bev] (ego-plane)
-        E_inv:    [B, N, 4, 4]      (cam->world)
+        E:        [B, N, 4, 4]      (world->cam extrinsics)
 
         return: [B, N, Q, 1]
         """
-        device = E_inv.device
+        device = E.device
         grid = bev.grid.to(device)
         _, H_bev, W_bev = grid.shape
         Q = H_bev * W_bev
 
         xy = rearrange(grid[:2], 'c H W -> (H W) c')  # [Q,2]
 
+        # Compute E_inv (cam->world) to get camera position
+        E_inv = torch.linalg.inv(E)
         cam_center = E_inv[..., :3, 3]                # [B,N,3], cam in world
         cam_xy = cam_center[..., :2]                  # [B,N,2]
 
@@ -388,13 +399,18 @@ class CrossViewAttention(nn.Module):
         return lambda_qi.unsqueeze(-1)                # [B,N,Q,1]
 
     # -------- EAF W_{q,k} 계산 --------
-    def _compute_eaf_weights(self, bev: BEVEmbedding, I_inv, E_inv):
+    @torch.no_grad()  # EAF weights are pure geometric - no gradients needed
+    def _compute_eaf_weights(self, bev: BEVEmbedding, I, E):
         """
+        I: [B, N, 3, 3] intrinsics
+        E: [B, N, 4, 4] extrinsics (world->cam)
+
         Returns:
           W_logits: [B, Q, NK]  with NK = N * (feat_h * feat_w)
+          vis_flat: [B, Q, NK]  visibility mask
         """
-        device = I_inv.device
-        B, N, _, _ = I_inv.shape
+        device = I.device
+        B, N, _, _ = I.shape
 
         grid = bev.grid.to(device)
         _, H_bev, W_bev = grid.shape
@@ -411,33 +427,20 @@ class CrossViewAttention(nn.Module):
         P0 = P0.unsqueeze(0).unsqueeze(0).expand(B, N, Q, 4) # [B,N,Q,4]
         P1 = P1.unsqueeze(0).unsqueeze(0).expand(B, N, Q, 4)
 
-        # world->cam (use inverse with better error handling)
-        try:
-            E = torch.inverse(E_inv)
-        except RuntimeError:
-            # fallback: add small regularization
-            E = torch.inverse(E_inv + 1e-6 * torch.eye(4, device=device, dtype=E_inv.dtype).unsqueeze(0).unsqueeze(0))
-
+        # world->cam: apply E directly (no inverse needed, E is already world->cam)
         P0_cam = torch.einsum('bnij,bnqj->bnqi', E, P0.contiguous())
         P1_cam = torch.einsum('bnij,bnqj->bnqi', E, P1.contiguous())
 
-        # intrinsics
-        try:
-            I = torch.inverse(I_inv)
-        except RuntimeError:
-            # fallback: add small regularization
-            I = torch.inverse(I_inv + 1e-6 * torch.eye(3, device=device, dtype=I_inv.dtype).unsqueeze(0).unsqueeze(0))
+        # cam->pixel: compute I_inv for pixel projection
+        I_inv = torch.linalg.inv(I)
 
+        # cam->pixel: use K directly (no inverse)
         p0 = torch.einsum('bnij,bnqj->bnqi', I, P0_cam[..., :3])
         p1 = torch.einsum('bnij,bnqj->bnqi', I, P1_cam[..., :3])
 
-        # safer division with larger epsilon and clamping
-        p0_z = torch.clamp(p0[..., 2:3].abs(), min=1e-6)
-        p1_z = torch.clamp(p1[..., 2:3].abs(), min=1e-6)
         p0 = p0 / torch.clamp(p0[..., 2:3], min=1e-6)
         p1 = p1 / torch.clamp(p1[..., 2:3], min=1e-6)
-
-
+        
         # epipolar line (homogeneous line)
         l = torch.cross(p0, p1, dim=-1)                      # [B,N,Q,3]
         denom = torch.clamp(torch.sqrt(l[...,0]**2 + l[...,1]**2), min=1e-8)
@@ -453,7 +456,7 @@ class CrossViewAttention(nn.Module):
 
         # Adaptive λ_{q,i}
         if self.use_adaptive_lambda:
-            lambda_qi = self._compute_lambda_qi(bev, E_inv)  # [B,N,Q,1]
+            lambda_qi = self._compute_lambda_qi(bev, E)  # [B,N,Q,1]
         else:
             lambda_qi = torch.ones((B, N, Q, 1), device=device, dtype=d.dtype)
 
@@ -468,8 +471,8 @@ class CrossViewAttention(nn.Module):
         scale_x = feat_w / float(self.image_width)
         scale_y = feat_h / float(self.image_height)
 
-        # 다중 z 샘플링 (any-of 방식)
-        z_samples = torch.tensor([0.2, 1.2, 2.5, self.eaf_zmax],
+        # 다중 z 샘플링 (any-of 방식) - wider range for better visibility detection
+        z_samples = torch.tensor([0.0, 0.5, 1.5, 3.0, self.eaf_zmax],
                                  device=device, dtype=grid.dtype)  # [Nz]
         Nz = len(z_samples)
 
@@ -486,8 +489,7 @@ class CrossViewAttention(nn.Module):
         # [B,N,Q,Nz,4]로 확장 후 변환
         Pz = Pz.unsqueeze(0).unsqueeze(0).expand(B, N, Q, Nz, 4)
 
-        # 카메라 좌표계로 변환: [B,N,Q,Nz,4]
-        E = torch.inverse(E_inv)
+        # 카메라 좌표계로 변환: [B,N,Q,Nz,4] (reuse E from above)
         Pz_cam = torch.einsum('bnij,bnqzj->bnqzi', E, Pz)
 
         # cheirality 체크
@@ -517,7 +519,9 @@ class CrossViewAttention(nn.Module):
 
         # 카메라+픽셀 축 flatten → [B,Q,NK]
         W = rearrange(W, 'b n Q K -> b Q (n K)')
-        return W
+        vis_flat = rearrange(vis, 'b n Q 1 -> b Q n').repeat_interleave(K_per, dim=-1)  # [B,Q,NK]
+
+        return W, vis_flat
 
     # -------- forward --------
     def forward(
@@ -525,8 +529,8 @@ class CrossViewAttention(nn.Module):
         x: torch.FloatTensor,          # [B, D, H_bev, W_bev]
         bev: BEVEmbedding,
         feature: torch.FloatTensor,    # [B, N, C_in, h, w]
-        I_inv: torch.FloatTensor,      # [B, N, 3, 3]
-        E_inv: torch.FloatTensor,      # [B, N, 4, 4]
+        I: torch.FloatTensor,          # [B, N, 3, 3] intrinsics
+        E: torch.FloatTensor,          # [B, N, 4, 4] extrinsics
     ):
         B, N, C_in, h, w = feature.shape
 
@@ -543,8 +547,8 @@ class CrossViewAttention(nn.Module):
         v = rearrange(val_flat, '(b n) d h w -> b n d h w', b=B, n=N)
         k = rearrange(key_flat, '(b n) d h w -> b n d h w', b=B, n=N)
 
-        # EAF weights
-        W_logits = self._compute_eaf_weights(bev, I_inv, E_inv)  # [B,Q,NK]
+        # EAF weights with visibility
+        W_logits, vis_flat = self._compute_eaf_weights(bev, I, E)  # [B,Q,NK], [B,Q,NK]
 
         # Cross-attention (no positional enc; only EAF guides)
         out = self.cross_attend(
@@ -552,6 +556,7 @@ class CrossViewAttention(nn.Module):
             k=k,
             v=v,
             W_logits=W_logits,
+            vis_flat=vis_flat,
             skip=x if self.skip else None,
         )
         return out
@@ -707,10 +712,7 @@ class CrossViewAttention(nn.Module):
 
         # Transform to camera space: ego->cam
         # E_inv is cam->ego, so we need ego->cam
-        try:
-            E = torch.inverse(E_inv)
-        except RuntimeError:
-            E = torch.inverse(E_inv + 1e-6 * torch.eye(4, device=device, dtype=E_inv.dtype).unsqueeze(0).unsqueeze(0))
+        E = torch.linalg.inv(E_inv)
 
         P0_cam = torch.einsum('bnij,bnqj->bnqi', E, P0.contiguous())
         P1_cam = torch.einsum('bnij,bnqj->bnqi', E, P1.contiguous())
@@ -720,10 +722,7 @@ class CrossViewAttention(nn.Module):
         z1 = P1_cam[..., 2]
 
         # Project to image coordinates (image resolution)
-        try:
-            I = torch.inverse(I_inv)
-        except RuntimeError:
-            I = torch.inverse(I_inv + 1e-6 * torch.eye(3, device=device, dtype=I_inv.dtype).unsqueeze(0).unsqueeze(0))
+        I = torch.linalg.inv(I_inv)
 
         p0 = torch.einsum('bnij,bnqj->bnqi', I, P0_cam[..., :3])
         p1 = torch.einsum('bnij,bnqj->bnqi', I, P1_cam[..., :3])
@@ -774,11 +773,13 @@ class CrossViewAttention(nn.Module):
 def log_eaf_fig3_style(
     W_logits: torch.Tensor,     # [B, Q, NK]
     bev_grid: torch.Tensor,     # [3, H, W] BEV grid
-    I_inv: torch.Tensor,        # [B, N, 3, 3] intrinsics inverse
-    E_inv: torch.Tensor,        # [B, N, 4, 4] extrinsics inverse
+    I: torch.Tensor,            # [B, N, 3, 3] intrinsics
+    E: torch.Tensor,            # [B, N, 4, 4] extrinsics
     n_cams: int,
     feat_h: int,
     feat_w: int,
+    image_width: int,
+    image_height: int,
     cam_idx: int = 0,           # front camera
     q_samples=None,             # list of (x, y) coordinates
     step: int = 0,
@@ -808,13 +809,10 @@ def log_eaf_fig3_style(
     H_bev, W_bev = bev_grid.shape[-2:]
     assert Q == H_bev * W_bev
 
-    # Compute visibility mask for this camera
-    try:
-        I = torch.inverse(I_inv[b_idx, cam_idx])
-        E = torch.inverse(E_inv[b_idx, cam_idx])
-    except RuntimeError:
-        I = torch.inverse(I_inv[b_idx, cam_idx] + 1e-6 * torch.eye(3, device=I_inv.device, dtype=I_inv.dtype))
-        E = torch.inverse(E_inv[b_idx, cam_idx] + 1e-6 * torch.eye(4, device=E_inv.device, dtype=E_inv.dtype))
+    # Get intrinsics and extrinsics for this camera
+    I_cam = I[b_idx, cam_idx]  # [3, 3]
+    E_cam = E[b_idx, cam_idx]  # [4, 4]
+
 
     # Transform BEV points to camera
     xy = rearrange(bev_grid[:2], 'c h w -> (h w) c')  # [Q, 2]
@@ -822,18 +820,18 @@ def log_eaf_fig3_style(
     ones = torch.ones(Q, 1, device=bev_grid.device, dtype=bev_grid.dtype)
     Xw = torch.cat([xy, zeros, ones], dim=-1)  # [Q, 4] homogeneous
 
-    Xc = (E @ Xw.T).T[:, :3]  # [Q, 3] in camera space
+    Xc = (E_cam @ Xw.T).T[:, :3]  # [Q, 3] in camera space
     zc = Xc[:, 2]
 
     # Project to image
-    p = (I @ Xc.T).T  # [Q, 3]
+    p = (I_cam @ Xc.T).T
     u = p[:, 0] / (p[:, 2] + 1e-6)
     v = p[:, 1] / (p[:, 2] + 1e-6)
 
-    # Check visibility
+    # Check visibility (use image dimensions, not 0-1)
     ok_z = zc > 0
-    ok_u = (u >= 0) & (u <= 1)
-    ok_v = (v >= 0) & (v <= 1)
+    ok_u = (u >= 0) & (u < image_width)
+    ok_v = (v >= 0) & (v < image_height)
     vis_mask = (ok_z & ok_u & ok_v).view(H_bev, W_bev).cpu().numpy()
 
     # Create figure
@@ -875,7 +873,7 @@ def log_eaf_fig3_style(
         c = q % W_bev
 
         # Debug: print to verify coordinates match
-        print(f"Target: ({x_star:.1f}, {y_star:.1f}) -> q={q} at grid (r={r}, c={c}) with ego ({x_q:.1f}, {y_q:.1f})")
+        # print(f"Target: ({x_star:.1f}, {y_star:.1f}) -> q={q} at grid (r={r}, c={c}) with ego ({x_q:.1f}, {y_q:.1f})")
 
         # Highlight on BEV grid
         # Note: imshow with origin='lower' means row=0 is at bottom
@@ -1018,8 +1016,8 @@ class Encoder(nn.Module):
         b, n, _, _, _ = batch['image'].shape
 
         image = batch['image'].flatten(0, 1)            # b n c h w
-        I_inv = batch['intrinsics'].inverse()           # b n 3 3
-        E_inv = batch['extrinsics'].inverse()           # b n 4 4
+        I = batch['intrinsics']                         # b n 3 3 (no inverse here)
+        E = batch['extrinsics']                         # b n 4 4 (no inverse here)
 
         features = [self.down(y) for y in self.backbone(self.norm(image))]
 
@@ -1029,7 +1027,7 @@ class Encoder(nn.Module):
         for cross_view, feature, layer in zip(self.cross_views, features, self.layers):
             feature = rearrange(feature, '(b n) ... -> b n ...', b=b, n=n)
 
-            x = cross_view(x, self.bev_embedding, feature, I_inv, E_inv)
+            x = cross_view(x, self.bev_embedding, feature, I, E)
             x = layer(x)
 
         return x
