@@ -372,7 +372,6 @@ class CrossViewAttention(nn.Module):
         self.feat_width = feat_width
 
     # -------- Adaptive λ_{q,i} --------
-    @torch.no_grad()  # No gradients needed for geometric computation
     def _compute_lambda_qi(self, bev: BEVEmbedding, E: torch.Tensor):
         """
         Adaptive λ_{q,i}
@@ -408,7 +407,6 @@ class CrossViewAttention(nn.Module):
         return lambda_qi.unsqueeze(-1)                # [B,N,Q,1]
 
     # -------- EAF W_{q,k} 계산 --------
-    @torch.no_grad()  # EAF weights are pure geometric - no gradients needed
     def _compute_eaf_weights(self, bev: BEVEmbedding, I, E):
         """
         I: [B, N, 3, 3] intrinsics
