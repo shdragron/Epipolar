@@ -12,6 +12,9 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
 
+# Set matplotlib backend to Agg for thread safety (must be before pyplot import)
+import matplotlib
+matplotlib.use('Agg')
 
 ResNetBottleNeck = lambda c: Bottleneck(c, c // 4)
 
@@ -160,13 +163,14 @@ class CrossAttentionEAF(nn.Module):
         )
         self.postnorm = norm(dim)
 
-    def forward(self, q, k, v, W_logits, vis_flat, skip=None):
+    def forward(self, q, k, v, W_logits, vis_per_cam, K_per, skip=None):
         """
         q: [B, D, H_bev, W_bev]
         k: [B, N, D, h, w]
         v: [B, N, D, h, w]
         W_logits: [B, Q, NK]
-        vis_flat: [B, Q, NK]  # visibility mask (0 or 1)
+        vis_per_cam: [B, Q, N]  # per-camera visibility mask (0 or 1)
+        K_per: int  # number of pixels per camera
         """
         B, D, H_bev, W_bev = q.shape
         Bk, N, Dk, h, w = k.shape
@@ -204,6 +208,10 @@ class CrossAttentionEAF(nn.Module):
         logits = torch.einsum('b h Q d, b h K d -> b h Q K', q, k) * self.scale
 
         # ---- mask invisible keys ----
+        # Expand vis_per_cam [B, Q, N] -> [B, Q, NK] using repeat_interleave
+        # This is done here instead of in _compute_eaf_weights to save memory during forward pass
+        vis_flat = vis_per_cam.repeat_interleave(K_per, dim=-1)  # [B, Q, NK]
+
         # vis_flat: [B, Q, NK] -> [B, 1, Q, NK], broadcast to [B, H, Q, NK]
         # Use dtype-safe minimum value for fp16/fp32 compatibility
         neg_inf = torch.finfo(logits.dtype).min
@@ -325,9 +333,10 @@ class CrossViewAttention(nn.Module):
         super().__init__()
 
         # 이미지 feature grid (키 좌표용; positional encoding 용도 X)
+        # Scale by feature dimensions to keep everything in feature coordinate space
         image_plane = generate_grid(feat_height, feat_width)         # [1,3,h,w]
-        image_plane[:, 0] *= image_width
-        image_plane[:, 1] *= image_height
+        image_plane[:, 0] *= feat_width
+        image_plane[:, 1] *= feat_height
         self.register_buffer('image_plane', image_plane, persistent=False)
 
         # 값/키용 feature projection
@@ -431,12 +440,17 @@ class CrossViewAttention(nn.Module):
         P0_cam = torch.einsum('bnij,bnqj->bnqi', E, P0.contiguous())
         P1_cam = torch.einsum('bnij,bnqj->bnqi', E, P1.contiguous())
 
-        # cam->pixel: compute I_inv for pixel projection
-        I_inv = torch.linalg.inv(I)
+        # Scale intrinsics from image coordinates to feature coordinates
+        feat_h, feat_w = self.feat_height, self.feat_width
+        S = I.new_zeros(I.shape)
+        S[..., 0, 0] = feat_w / float(self.image_width)
+        S[..., 1, 1] = feat_h / float(self.image_height)
+        S[..., 2, 2] = 1.0
+        K_feat = torch.einsum('bnij,bnjk->bnik', S, I)  # [B,N,3,3]
 
-        # cam->pixel: use K directly (no inverse)
-        p0 = torch.einsum('bnij,bnqj->bnqi', I, P0_cam[..., :3])
-        p1 = torch.einsum('bnij,bnqj->bnqi', I, P1_cam[..., :3])
+        # cam->feature_pixel: use scaled intrinsics K_feat
+        p0 = torch.einsum('bnij,bnqj->bnqi', K_feat, P0_cam[..., :3])
+        p1 = torch.einsum('bnij,bnqj->bnqi', K_feat, P1_cam[..., :3])
 
         p0 = p0 / torch.clamp(p0[..., 2:3], min=1e-6)
         p1 = p1 / torch.clamp(p1[..., 2:3], min=1e-6)
@@ -465,12 +479,7 @@ class CrossViewAttention(nn.Module):
 
         W = torch.exp(- scale * (d ** 2))                    # [B,N,Q,K_per]
 
-        # ====== [NEW] 가시성 게이트 (다중 z-샘플링 + 정확한 스케일링) ======
-        # 정확한 feat 스케일 (원본 이미지 해상도 기준)
-        feat_h, feat_w = self.feat_height, self.feat_width
-        scale_x = feat_w / float(self.image_width)
-        scale_y = feat_h / float(self.image_height)
-
+        # ====== [NEW] 가시성 게이트 (다중 z-샘플링 + 일관된 좌표계) ======
         # 다중 z 샘플링 (any-of 방식) - wider range for better visibility detection
         z_samples = torch.tensor([0.0, 0.5, 1.5, 3.0, self.eaf_zmax],
                                  device=device, dtype=grid.dtype)  # [Nz]
@@ -496,16 +505,12 @@ class CrossViewAttention(nn.Module):
         z_cam = Pz_cam[..., 2]                                     # [B,N,Q,Nz]
         cheir = (z_cam > 0)                                        # [B,N,Q,Nz]
 
-        # 픽셀 투영
-        pz = torch.einsum('bnij,bnqzj->bnqzi', I, Pz_cam[..., :3])  # [B,N,Q,Nz,3]
-        u = pz[..., 0] / torch.clamp(pz[..., 2], min=1e-6)
-        v = pz[..., 1] / torch.clamp(pz[..., 2], min=1e-6)
+        # 픽셀 투영: K_feat를 사용하여 feature 좌표로 직접 투영
+        pz_feat = torch.einsum('bnij,bnqzj->bnqzi', K_feat, Pz_cam[..., :3])  # [B,N,Q,Nz,3]
+        u_feat = pz_feat[..., 0] / torch.clamp(pz_feat[..., 2], min=1e-6)
+        v_feat = pz_feat[..., 1] / torch.clamp(pz_feat[..., 2], min=1e-6)
 
-        # 이미지 좌표 → feature 좌표
-        u_feat = u * scale_x
-        v_feat = v * scale_y
-
-        # in-bounds 체크
+        # in-bounds 체크 (이미 feature 좌표계이므로 직접 비교)
         inb = (u_feat >= 0) & (u_feat < feat_w) & (v_feat >= 0) & (v_feat < feat_h)  # [B,N,Q,Nz]
 
         # any-of: 하나라도 보이면 visible
@@ -519,9 +524,11 @@ class CrossViewAttention(nn.Module):
 
         # 카메라+픽셀 축 flatten → [B,Q,NK]
         W = rearrange(W, 'b n Q K -> b Q (n K)')
-        vis_flat = rearrange(vis, 'b n Q 1 -> b Q n').repeat_interleave(K_per, dim=-1)  # [B,Q,NK]
 
-        return W, vis_flat
+        # Visibility: keep in [B, Q, N] to save memory (will be expanded on-the-fly in attention)
+        vis_per_cam = rearrange(vis, 'b n Q 1 -> b Q n')  # [B, Q, N]
+
+        return W, vis_per_cam, K_per
 
     # -------- forward --------
     def forward(
@@ -548,7 +555,7 @@ class CrossViewAttention(nn.Module):
         k = rearrange(key_flat, '(b n) d h w -> b n d h w', b=B, n=N)
 
         # EAF weights with visibility
-        W_logits, vis_flat = self._compute_eaf_weights(bev, I, E)  # [B,Q,NK], [B,Q,NK]
+        W_logits, vis_per_cam, K_per = self._compute_eaf_weights(bev, I, E)  # [B,Q,NK], [B,Q,N], int
 
         # Cross-attention (no positional enc; only EAF guides)
         out = self.cross_attend(
@@ -556,7 +563,8 @@ class CrossViewAttention(nn.Module):
             k=k,
             v=v,
             W_logits=W_logits,
-            vis_flat=vis_flat,
+            vis_per_cam=vis_per_cam,
+            K_per=K_per,
             skip=x if self.skip else None,
         )
         return out
@@ -566,7 +574,7 @@ class CrossViewAttention(nn.Module):
     def log_lambda_qi(
         self,
         bev: BEVEmbedding,
-        E_inv: torch.Tensor,
+        E: torch.Tensor,
         step: int,
         sample: int = 5,
         tag: str = "lambda_qi"
@@ -576,7 +584,7 @@ class CrossViewAttention(nn.Module):
 
         Args:
             bev: BEV embedding containing grid
-            E_inv: [B, N, 4, 4] extrinsics inverse (cam->world)
+            E: [B, N, 4, 4] extrinsics (world->cam)
             step: current training step
             sample: number of random samples to log as text
             tag: W&B logging tag prefix
@@ -584,13 +592,16 @@ class CrossViewAttention(nn.Module):
         if not WANDB_AVAILABLE:
             return
 
-        device = E_inv.device
+        device = E.device
         grid = bev.grid.to(device)
         _, Hb, Wb = grid.shape
         Q = Hb * Wb
 
         xy = rearrange(grid[:2], 'c H W -> (H W) c')   # [Q,2]
-        cam_center = E_inv[..., :3, 3]                 # [B,N,3]
+
+        # Get camera position in world coordinates by inverting E
+        E_inv = torch.linalg.inv(E)
+        cam_center = E_inv[..., :3, 3]                 # [B,N,3], cam in world
         cam_xy = cam_center[..., :2]                   # [B,N,2]
 
         B, N = cam_xy.shape[:2]
@@ -651,8 +662,8 @@ class CrossViewAttention(nn.Module):
     def log_epipolar_diagnostics(
         self,
         bev: BEVEmbedding,
-        I_inv: torch.Tensor,
-        E_inv: torch.Tensor,
+        I: torch.Tensor,
+        E: torch.Tensor,
         step: int,
         num_samples: int = 100,
         tag: str = "epipolar_diag"
@@ -662,8 +673,8 @@ class CrossViewAttention(nn.Module):
 
         Args:
             bev: BEV embedding
-            I_inv: [B, N, 3, 3] intrinsics inverse
-            E_inv: [B, N, 4, 4] extrinsics inverse
+            I: [B, N, 3, 3] intrinsics (not inverse)
+            E: [B, N, 4, 4] extrinsics (world->cam, not inverse)
             step: training step
             num_samples: number of random query samples
             tag: W&B tag prefix
@@ -671,29 +682,14 @@ class CrossViewAttention(nn.Module):
         if not WANDB_AVAILABLE:
             return
 
-        device = E_inv.device
-        B, N = E_inv.shape[:2]
+        device = E.device
+        B, N = E.shape[:2]
         grid = bev.grid.to(device)
         _, H_bev, W_bev = grid.shape
         Q = H_bev * W_bev
 
         # Get feature resolution from image_plane
         _, _, feat_h, feat_w = self.image_plane.shape
-
-        # Scale intrinsics from image resolution to feature resolution
-        # image_plane is scaled by (image_w, image_h) at construction (lines 320-322)
-        # We need to invert this to get feature coordinates
-        img_plane_sample = self.image_plane[:, :, 0, 0]  # [1, 3]
-        img_w = img_plane_sample[0, 0].item() * feat_w  # recover image width
-        img_h = img_plane_sample[0, 1].item() * feat_h  # recover image height
-
-        # Actually, let's use the max values from image_plane directly
-        img_w = self.image_plane[0, 0].max().item()
-        img_h = self.image_plane[0, 1].max().item()
-
-        # Scale factor: feature_size / image_size
-        scale_x = feat_w / max(img_w, 1e-6)
-        scale_y = feat_h / max(img_h, 1e-6)
 
         xy = rearrange(grid[:2], 'c H W -> (H W) c')  # [Q,2]
         ones = torch.ones(Q, 1, device=device, dtype=grid.dtype)
@@ -710,10 +706,7 @@ class CrossViewAttention(nn.Module):
         P0 = P0.unsqueeze(0).unsqueeze(0).expand(B, N, num_samples, 4)
         P1 = P1.unsqueeze(0).unsqueeze(0).expand(B, N, num_samples, 4)
 
-        # Transform to camera space: ego->cam
-        # E_inv is cam->ego, so we need ego->cam
-        E = torch.linalg.inv(E_inv)
-
+        # Transform to camera space: E is already world->cam (no inverse needed)
         P0_cam = torch.einsum('bnij,bnqj->bnqi', E, P0.contiguous())
         P1_cam = torch.einsum('bnij,bnqj->bnqi', E, P1.contiguous())
 
@@ -721,23 +714,23 @@ class CrossViewAttention(nn.Module):
         z0 = P0_cam[..., 2]  # [B, N, num_samples]
         z1 = P1_cam[..., 2]
 
-        # Project to image coordinates (image resolution)
-        I = torch.linalg.inv(I_inv)
+        # Scale intrinsics from image coordinates to feature coordinates (same as _compute_eaf_weights)
+        # I is already the intrinsics matrix (no inverse needed)
+        S = I.new_zeros(I.shape)
+        S[..., 0, 0] = feat_w / float(self.image_width)
+        S[..., 1, 1] = feat_h / float(self.image_height)
+        S[..., 2, 2] = 1.0
+        K_feat = torch.einsum('bnij,bnjk->bnik', S, I)  # [B,N,3,3]
 
-        p0 = torch.einsum('bnij,bnqj->bnqi', I, P0_cam[..., :3])
-        p1 = torch.einsum('bnij,bnqj->bnqi', I, P1_cam[..., :3])
+        # Project directly to feature coordinates using K_feat
+        p0_feat = torch.einsum('bnij,bnqj->bnqi', K_feat, P0_cam[..., :3])
+        p1_feat = torch.einsum('bnij,bnqj->bnqi', K_feat, P1_cam[..., :3])
 
-        # Normalize by depth to get (u, v) in image coordinates
-        u0_img = p0[..., 0] / (torch.clamp(p0[..., 2].abs(), min=1e-6) * torch.sign(p0[..., 2] + 1e-10))
-        v0_img = p0[..., 1] / (torch.clamp(p0[..., 2].abs(), min=1e-6) * torch.sign(p0[..., 2] + 1e-10))
-        u1_img = p1[..., 0] / (torch.clamp(p1[..., 2].abs(), min=1e-6) * torch.sign(p1[..., 2] + 1e-10))
-        v1_img = p1[..., 1] / (torch.clamp(p1[..., 2].abs(), min=1e-6) * torch.sign(p1[..., 2] + 1e-10))
-
-        # Scale to feature coordinates
-        u0 = u0_img * scale_x
-        v0 = v0_img * scale_y
-        u1 = u1_img * scale_x
-        v1 = v1_img * scale_y
+        # Normalize by depth to get (u, v) in feature coordinates
+        u0 = p0_feat[..., 0] / torch.clamp(p0_feat[..., 2], min=1e-6)
+        v0 = p0_feat[..., 1] / torch.clamp(p0_feat[..., 2], min=1e-6)
+        u1 = p1_feat[..., 0] / torch.clamp(p1_feat[..., 2], min=1e-6)
+        v1 = p1_feat[..., 1] / torch.clamp(p1_feat[..., 2], min=1e-6)
 
         # Check if points are in feature bounds [0, feat_w] x [0, feat_h]
         p0_in_bounds = ((u0 >= 0) & (u0 < feat_w) & (v0 >= 0) & (v0 < feat_h))
@@ -813,6 +806,12 @@ def log_eaf_fig3_style(
     I_cam = I[b_idx, cam_idx]  # [3, 3]
     E_cam = E[b_idx, cam_idx]  # [4, 4]
 
+    # Scale intrinsics to feature coordinates (consistent with _compute_eaf_weights)
+    S = torch.zeros(3, 3, device=I_cam.device, dtype=I_cam.dtype)
+    S[0, 0] = feat_w / float(image_width)
+    S[1, 1] = feat_h / float(image_height)
+    S[2, 2] = 1.0
+    K_feat_cam = S @ I_cam  # [3, 3]
 
     # Transform BEV points to camera
     xy = rearrange(bev_grid[:2], 'c h w -> (h w) c')  # [Q, 2]
@@ -823,78 +822,81 @@ def log_eaf_fig3_style(
     Xc = (E_cam @ Xw.T).T[:, :3]  # [Q, 3] in camera space
     zc = Xc[:, 2]
 
-    # Project to image
-    p = (I_cam @ Xc.T).T
-    u = p[:, 0] / (p[:, 2] + 1e-6)
-    v = p[:, 1] / (p[:, 2] + 1e-6)
+    # Project to feature coordinates using K_feat
+    p_feat = (K_feat_cam @ Xc.T).T
+    u_feat = p_feat[:, 0] / (p_feat[:, 2] + 1e-6)
+    v_feat = p_feat[:, 1] / (p_feat[:, 2] + 1e-6)
 
-    # Check visibility (use image dimensions, not 0-1)
+    # Check visibility (use feature dimensions)
     ok_z = zc > 0
-    ok_u = (u >= 0) & (u < image_width)
-    ok_v = (v >= 0) & (v < image_height)
+    ok_u = (u_feat >= 0) & (u_feat < feat_w)
+    ok_v = (v_feat >= 0) & (v_feat < feat_h)
     vis_mask = (ok_z & ok_u & ok_v).view(H_bev, W_bev).cpu().numpy()
 
-    # Create figure
-    fig = plt.figure(figsize=(12, 6))
-    gs = fig.add_gridspec(2, 3, height_ratios=[1, 1])
-    ax_grid = fig.add_subplot(gs[:, 0])
-    ax_im1 = fig.add_subplot(gs[0, 1])
-    ax_im2 = fig.add_subplot(gs[0, 2])
-    ax_im3 = fig.add_subplot(gs[1, 1])
+    # Create figure with thread-safe handling
+    fig = None
+    try:
+        fig = plt.figure(figsize=(12, 6))
+        gs = fig.add_gridspec(2, 3, height_ratios=[1, 1])
+        ax_grid = fig.add_subplot(gs[:, 0])
+        ax_im1 = fig.add_subplot(gs[0, 1])
+        ax_im2 = fig.add_subplot(gs[0, 2])
+        ax_im3 = fig.add_subplot(gs[1, 1])
 
-    # Plot BEV visibility
-    grid_vis = np.zeros((H_bev, W_bev), dtype=np.float32)
-    grid_vis[vis_mask] = 1.0
-    ax_grid.imshow(grid_vis, origin='lower', cmap='viridis', vmin=0, vmax=1)
-    ax_grid.set_title(f"BEV cells visible to cam{cam_idx}")
-    ax_grid.set_xlabel("x (forward)")
-    ax_grid.set_ylabel("y (lateral)")
+        # Plot BEV visibility
+        grid_vis = np.zeros((H_bev, W_bev), dtype=np.float32)
+        grid_vis[vis_mask] = 1.0
+        ax_grid.imshow(grid_vis, origin='lower', cmap='viridis', vmin=0, vmax=1)
+        ax_grid.set_title(f"BEV cells visible to cam{cam_idx}")
+        ax_grid.set_xlabel("x (forward)")
+        ax_grid.set_ylabel("y (lateral)")
 
-    # Find query indices for target coordinates
-    xy_np = xy.cpu().numpy()
+        # Find query indices for target coordinates
+        xy_np = xy.cpu().numpy()
 
-    def pick_q(x_star, y_star):
-        d2 = (xy_np[:, 0] - x_star)**2 + (xy_np[:, 1] - y_star)**2
-        return int(np.argmin(d2))
+        def pick_q(x_star, y_star):
+            d2 = (xy_np[:, 0] - x_star)**2 + (xy_np[:, 1] - y_star)**2
+            return int(np.argmin(d2))
 
-    targets = list(q_samples)[:3]
-    axs = [ax_im1, ax_im2, ax_im3]
+        targets = list(q_samples)[:3]
+        axs = [ax_im1, ax_im2, ax_im3]
 
-    for (x_star, y_star), ax in zip(targets, axs):
-        q = pick_q(x_star, y_star)
+        for (x_star, y_star), ax in zip(targets, axs):
+            q = pick_q(x_star, y_star)
 
-        # Get the actual (x, y) ego coordinates for this query
-        x_q = xy_np[q, 0]
-        y_q = xy_np[q, 1]
+            # Get the actual (x, y) ego coordinates for this query
+            x_q = xy_np[q, 0]
+            y_q = xy_np[q, 1]
 
-        # Find the (row, col) in BEV grid
-        # bev_grid has shape [3, H, W], flattened to [Q, 3] with row-major order
-        r = q // W_bev
-        c = q % W_bev
+            # Find the (row, col) in BEV grid
+            # bev_grid has shape [3, H, W], flattened to [Q, 3] with row-major order
+            r = q // W_bev
+            c = q % W_bev
 
-        # Debug: print to verify coordinates match
-        # print(f"Target: ({x_star:.1f}, {y_star:.1f}) -> q={q} at grid (r={r}, c={c}) with ego ({x_q:.1f}, {y_q:.1f})")
+            # Highlight on BEV grid
+            # Note: imshow with origin='lower' means row=0 is at bottom
+            # matplotlib Rectangle uses (x, y) = (col, row) coordinates
+            rect = plt.Rectangle((c - 0.5, r - 0.5), 1, 1,
+                                fill=False, edgecolor='red', lw=2)
+            ax_grid.add_patch(rect)
 
-        # Highlight on BEV grid
-        # Note: imshow with origin='lower' means row=0 is at bottom
-        # matplotlib Rectangle uses (x, y) = (col, row) coordinates
-        rect = plt.Rectangle((c - 0.5, r - 0.5), 1, 1,
-                            fill=False, edgecolor='red', lw=2)
-        ax_grid.add_patch(rect)
+            # Show EAF heatmap
+            heat = W_cam[q].cpu().numpy()  # [h, w]
+            im = ax.imshow(heat, origin='upper', cmap='magma', vmin=0, vmax=1)
+            ax.set_title(f"({x_star:.1f}m, {y_star:.1f}m)")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            plt.colorbar(im, ax=ax, fraction=0.046)
 
-        # Show EAF heatmap
-        heat = W_cam[q].cpu().numpy()  # [h, w]
-        im = ax.imshow(heat, origin='upper', cmap='magma', vmin=0, vmax=1)
-        ax.set_title(f"({x_star:.1f}m, {y_star:.1f}m)")
-        ax.set_xticks([])
-        ax.set_yticks([])
-        plt.colorbar(im, ax=ax, fraction=0.046)
+        plt.tight_layout()
 
-    plt.tight_layout()
-
-    # Log to W&B
-    wandb.log({f"{tag}/cam{cam_idx}": wandb.Image(fig), "step": step})
-    plt.close(fig)
+        # Log to W&B
+        wandb.log({f"{tag}/cam{cam_idx}": wandb.Image(fig), "step": step})
+    finally:
+        # Always close figure to prevent memory/thread leaks
+        if fig is not None:
+            plt.close(fig)
+            del fig
 
 
 # -------- Utility function for EAF visualization --------

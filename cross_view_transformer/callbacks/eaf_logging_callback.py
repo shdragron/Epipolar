@@ -76,98 +76,122 @@ class EAFLoggingCallback(pl.Callback):
 
         # (1) Log adaptive lambda statistics
         if global_step % self.lambda_log_interval == 0 and global_step > 0:
+            was_training = pl_module.training
             try:
-                I_inv = batch['intrinsics'].inverse()
-                E_inv = batch['extrinsics'].inverse()
+                pl_module.eval()  # Set to eval mode for logging
+                with torch.no_grad():
+                    I = batch['intrinsics']
+                    E = batch['extrinsics']
 
-                cross_view.log_lambda_qi(
-                    bev=encoder.bev_embedding,
-                    E_inv=E_inv,
-                    step=global_step,
-                    sample=self.num_samples,
-                    tag="adaptive_lambda",
-                )
+                    cross_view.log_lambda_qi(
+                        bev=encoder.bev_embedding,
+                        E=E,  # Passing extrinsics (world->cam)
+                        step=global_step,
+                        sample=self.num_samples,
+                        tag="adaptive_lambda",
+                    )
 
-                # Log epipolar diagnostics
-                cross_view.log_epipolar_diagnostics(
-                    bev=encoder.bev_embedding,
-                    I_inv=I_inv,
-                    E_inv=E_inv,
-                    step=global_step,
-                    num_samples=100,
-                    tag="epipolar_diag",
-                )
+                    # Log epipolar diagnostics
+                    cross_view.log_epipolar_diagnostics(
+                        bev=encoder.bev_embedding,
+                        I=I,  # Passing intrinsics (not inverse)
+                        E=E,  # Passing extrinsics (world->cam, not inverse)
+                        step=global_step,
+                        num_samples=100,
+                        tag="epipolar_diag",
+                    )
             except Exception as e:
                 print(f"Error logging lambda_qi at step {global_step}: {e}")
+            finally:
+                if was_training:
+                    pl_module.train()
+                # Cleanup
+                torch.cuda.empty_cache()
 
         # (2) Log EAF attention weight maps
         if global_step % self.eaf_vis_interval == 0 and global_step > 0:
+            was_training = pl_module.training
+            W_logits = None
             try:
-                I_inv = batch['intrinsics'].inverse()
-                E_inv = batch['extrinsics'].inverse()
-
-                # Compute EAF weights
+                pl_module.eval()  # Set to eval mode for logging
                 with torch.no_grad():
+                    I = batch['intrinsics']
+                    E = batch['extrinsics']
+
+                    # Compute EAF weights
                     out = cross_view._compute_eaf_weights(
-                    bev=encoder.bev_embedding,
-                    I_inv=I_inv,
-                    E_inv=E_inv,
+                        bev=encoder.bev_embedding,
+                        I=I,
+                        E=E,
                     )
-                    W_logits = out[0] if isinstance(out, tuple) else out
-                    
-                n_cams = batch['image'].shape[1]
-                feat_h = cross_view.image_plane.shape[-2]
-                feat_w = cross_view.image_plane.shape[-1]
+                    # Unpack tuple: (W_logits, vis_per_cam, K_per)
+                    if isinstance(out, tuple) and len(out) == 3:
+                        W_logits = out[0]
+                    else:
+                        W_logits = out[0] if isinstance(out, tuple) else out
 
-                # Select query indices by real BEV coordinates (not flat indices)
-                targets_xy = [
-                    # ---- Front band (정면) ----
-                    (8.0,  0.0),  (15.0,  0.0),  (25.0,  0.0),  (40.0,  0.0),
-                    (15.0,  3.0), (15.0, -3.0), (25.0,  6.0), (25.0, -6.0),
+                    n_cams = batch['image'].shape[1]
+                    feat_h = cross_view.image_plane.shape[-2]
+                    feat_w = cross_view.image_plane.shape[-1]
 
-                    # ---- Front-Left / Front-Right (전측면) ----
-                    (12.0,  8.0), (20.0, 12.0), (28.0, 16.0),
-                    (12.0, -8.0), (20.0,-12.0), (28.0,-16.0),
+                    # Select query indices by real BEV coordinates (not flat indices)
+                    targets_xy = [
+                        # ---- Front band (정면) ----
+                        (8.0,  0.0),  (15.0,  0.0),  (25.0,  0.0),  (40.0,  0.0),
+                        (15.0,  3.0), (15.0, -3.0), (25.0,  6.0), (25.0, -6.0),
 
-                    # ---- Side far (측면 멀리; 차량 바로 옆/사선) ----
-                    (5.0,  20.0), (10.0, 25.0), (5.0, -20.0), (10.0, -25.0),
+                        # ---- Front-Left / Front-Right (전측면) ----
+                        (12.0,  8.0), (20.0, 12.0), (28.0, 16.0),
+                        (12.0, -8.0), (20.0,-12.0), (28.0,-16.0),
 
-                    # ---- Back band (후방) ----
-                    (-8.0,  0.0), (-15.0,  0.0), (-25.0,  0.0), (-40.0,  0.0),
-                    (-15.0,  4.0), (-15.0, -4.0),
+                        # ---- Side far (측면 멀리; 차량 바로 옆/사선) ----
+                        (5.0,  20.0), (10.0, 25.0), (5.0, -20.0), (10.0, -25.0),
 
-                    # ---- Back-Left / Back-Right (후측면) ----
-                    (-12.0,  8.0), (-20.0, 12.0),
-                    (-12.0, -8.0), (-20.0,-12.0),
-                ]
-                # 그리드 범위 밖 좌표는 필터(안전)
-                targets_xy = [p for p in targets_xy if self._xy_in_bev_bounds(encoder.bev_embedding.grid, p)]
-                q_indices = self._pick_queries_by_xy(encoder.bev_embedding.grid, targets_xy)
+                        # ---- Back band (후방) ----
+                        (-8.0,  0.0), (-15.0,  0.0), (-25.0,  0.0), (-40.0,  0.0),
+                        (-15.0,  4.0), (-15.0, -4.0),
 
-                log_eaf_maps_to_wandb(
-                    W_logits=W_logits,
-                    n_cams=n_cams, feat_h=feat_h, feat_w=feat_w,
-                    q_indices=q_indices, q_coords=targets_xy,
-                    step=global_step, tag="EAF",
-                )
+                        # ---- Back-Left / Back-Right (후측면) ----
+                        (-12.0,  8.0), (-20.0, 12.0),
+                        (-12.0, -8.0), (-20.0,-12.0),
+                    ]
+                    # 그리드 범위 밖 좌표는 필터(안전)
+                    targets_xy = [p for p in targets_xy if self._xy_in_bev_bounds(encoder.bev_embedding.grid, p)]
+                    q_indices = self._pick_queries_by_xy(encoder.bev_embedding.grid, targets_xy)
 
-                # Log Fig.3 style visualization (front camera only)
-                from cross_view_transformer.model.encoder import log_eaf_fig3_style
-                log_eaf_fig3_style(
-                    W_logits=W_logits,
-                    bev_grid=encoder.bev_embedding.grid,
-                    I_inv=I_inv,
-                    E_inv=E_inv,
-                    n_cams=n_cams,
-                    feat_h=feat_h,
-                    feat_w=feat_w,
-                    cam_idx=1,  # CAM_FRONT (nuScenes: 0=FL, 1=F, 2=FR)
-                    q_samples=[(10.0, 0.0), (25.0, -3.0), (25.0, 3.0)],
-                    step=global_step,
-                    tag="EAF_Fig3",
-                )
+                    log_eaf_maps_to_wandb(
+                        W_logits=W_logits,
+                        n_cams=n_cams, feat_h=feat_h, feat_w=feat_w,
+                        q_indices=q_indices, q_coords=targets_xy,
+                        step=global_step, tag="EAF",
+                    )
+
+                    # Log Fig.3 style visualization (front camera only)
+                    from cross_view_transformer.model.encoder import log_eaf_fig3_style
+                    log_eaf_fig3_style(
+                        W_logits=W_logits,
+                        bev_grid=encoder.bev_embedding.grid,
+                        I=I,
+                        E=E,
+                        n_cams=n_cams,
+                        feat_h=feat_h,
+                        feat_w=feat_w,
+                        image_width=cross_view.image_width,
+                        image_height=cross_view.image_height,
+                        cam_idx=1,  # CAM_FRONT (nuScenes: 0=FL, 1=F, 2=FR)
+                        q_samples=[(10.0, 0.0), (25.0, -3.0), (25.0, 3.0)],
+                        step=global_step,
+                        tag="EAF_Fig3",
+                    )
             except Exception as e:
                 print(f"Error logging EAF maps at step {global_step}: {e}")
+            finally:
+                if was_training:
+                    pl_module.train()
+                # Cleanup
+                if W_logits is not None:
+                    del W_logits
+                torch.cuda.empty_cache()
 
     def _pick_queries_by_xy(self, grid: torch.Tensor, targets_xy: list):
         """

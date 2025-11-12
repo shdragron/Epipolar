@@ -62,7 +62,7 @@ def main(cfg):
 
         VisualizationCallback(viz_fn, cfg.experiment.log_image_interval),
         GitDiffCallback(cfg),
-        EAFLoggingCallback(lambda_log_interval=50, eaf_vis_interval=100)
+        EAFLoggingCallback(lambda_log_interval=4000, eaf_vis_interval=4000)
     ]
 
     # Train
