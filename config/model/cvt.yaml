@@ -31,11 +31,12 @@ encoder:
     image_width: ${data.image.w}
 
     # EAF (Epipolar Attention Field) parameters
-    eaf_lambda: 1.0              # base scaling factor for epipolar attention
-    eaf_zmax: 10.0               # maximum height (z) for epipolar line
+    eaf_lambda: 2.0              # base scaling factor for epipolar attention (increased from 1.0 for stronger signal)
+    eaf_zmax: 5.0                # maximum height (z) for epipolar line (reduced from 10.0 to match typical scene height)
     use_adaptive_lambda: True    # adapt lambda based on camera-BEV distance
     min_sigma: 2.5               # minimum sigma (far objects, very sharp attention for perspective)
     max_sigma: 14.0              # maximum sigma (near objects, very wide attention for perspective)
+    use_log_space_eaf: True      # use log-space bias (True) or Hadamard product (False) for applying EAF weights
 
   bev_embedding:
     sigma: 1.0

@@ -137,11 +137,12 @@ class CrossAttentionEAF(nn.Module):
     출력:
       z: [B, D, H_bev, W_bev]
     """
-    def __init__(self, dim, heads, dim_head, qkv_bias, norm=nn.LayerNorm):
+    def __init__(self, dim, heads, dim_head, qkv_bias, use_log_space_eaf=True, norm=nn.LayerNorm):
         super().__init__()
         self.heads = heads
         self.dim_head = dim_head
         self.scale = dim_head ** -0.5
+        self.use_log_space_eaf = use_log_space_eaf
 
         inner_dim = heads * dim_head
 
@@ -207,20 +208,28 @@ class CrossAttentionEAF(nn.Module):
         # logits: [B, H, Q, NK]
         logits = torch.einsum('b h Q d, b h K d -> b h Q K', q, k) * self.scale
 
-        # ---- mask invisible keys ----
+        # ---- mask invisible keys (soft gate instead of hard mask) ----
         # Expand vis_per_cam [B, Q, N] -> [B, Q, NK] using repeat_interleave
         # This is done here instead of in _compute_eaf_weights to save memory during forward pass
         vis_flat = vis_per_cam.repeat_interleave(K_per, dim=-1)  # [B, Q, NK]
 
         # vis_flat: [B, Q, NK] -> [B, 1, Q, NK], broadcast to [B, H, Q, NK]
-        # Use dtype-safe minimum value for fp16/fp32 compatibility
-        neg_inf = torch.finfo(logits.dtype).min
-        logits = logits.masked_fill(vis_flat.unsqueeze(1) == 0, neg_inf)
+        # Use soft visibility gate instead of hard masking
+        mask = vis_flat.unsqueeze(1).float()  # [B, 1, Q, NK]
+        vis_weight = 0.1 + 0.9 * mask  # 보이지 않으면 0.1배, 보이면 1.0배
+        logits = logits * vis_weight
 
-        # ---- apply Epipolar weights (multiplicative, as in W ⊙ (QK^T/√d)) ----
+        # ---- apply Epipolar weights ----
         # W_logits: [B, Q, NK] -> [B, 1, Q, NK], broadcast to [B, H, Q, NK]
-        W = W_logits.unsqueeze(1)  # Broadcasting instead of expand
-        logits = logits * W
+        if self.use_log_space_eaf:
+            # Log-space bias: provides more stable gradient flow
+            eps = 1e-6
+            W_log = torch.log(W_logits.unsqueeze(1).clamp_min(eps))  # [B, 1, Q, NK]
+            logits = logits + W_log
+        else:
+            # Hadamard product (original): direct multiplicative weighting
+            W = W_logits.unsqueeze(1)  # [B, 1, Q, NK]
+            logits = logits * W
 
         # ---- softmax over keys ----
         attn = torch.softmax(logits, dim=-1)   # [B, H, Q, NK]
@@ -329,6 +338,7 @@ class CrossViewAttention(nn.Module):
         use_adaptive_lambda: bool = True,
         min_sigma: float = 1.0,
         max_sigma: float = 8.0,
+        use_log_space_eaf: bool = True,
     ):
         super().__init__()
 
@@ -355,7 +365,7 @@ class CrossViewAttention(nn.Module):
                 nn.Conv2d(feat_dim, dim, 1, bias=False),
             )
 
-        self.cross_attend = CrossAttentionEAF(dim, heads, dim_head, qkv_bias)
+        self.cross_attend = CrossAttentionEAF(dim, heads, dim_head, qkv_bias, use_log_space_eaf)
         self.skip = skip
 
         # EAF params
@@ -364,6 +374,7 @@ class CrossViewAttention(nn.Module):
         self.use_adaptive_lambda = use_adaptive_lambda
         self.min_sigma = min_sigma
         self.max_sigma = max_sigma
+        self.use_log_space_eaf = use_log_space_eaf
 
         # Store original image dimensions for proper visibility scaling
         self.image_height = image_height
@@ -439,11 +450,17 @@ class CrossViewAttention(nn.Module):
         P1_cam = torch.einsum('bnij,bnqj->bnqi', E, P1.contiguous())
 
         # Scale intrinsics from image coordinates to feature coordinates
+        # Note: I already contains resize/crop transformations from LoadDataTransform
         feat_h, feat_w = self.feat_height, self.feat_width
         S = I.new_zeros(I.shape)
         S[..., 0, 0] = feat_w / float(self.image_width)
         S[..., 1, 1] = feat_h / float(self.image_height)
         S[..., 2, 2] = 1.0
+
+        # Apply feature stride offset correction (deep layers have 0.5 pixel shift)
+        S[..., 0, 2] = 0.5  # x offset
+        S[..., 1, 2] = 0.5  # y offset
+
         K_feat = torch.einsum('bnij,bnjk->bnik', S, I)  # [B,N,3,3]
 
         # cam->feature_pixel: use scaled intrinsics K_feat
